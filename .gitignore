@@ -1,0 +1,7 @@
+﻿.venv/
+ScenerioExports/
+runs/
+__pycache__/
+*.pt
+*.mp4
+*.mkv
