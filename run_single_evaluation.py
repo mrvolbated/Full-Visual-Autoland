@@ -141,12 +141,12 @@ def visualize_glide_path_verification(image_path, coords_json_path, guidance_out
 if __name__ == "__main__":
     # Corrected paths pointing to Heavy_Rain for AutoScenario_001
     WEATHER_FOLDER = "Broken_Clouds"
-    RAW_TELEMETRY = rf"C:\Users\User\Desktop\ILSData-main\ScenerioExports\weather\{WEATHER_FOLDER}\usable\telemetry\AutoScenario_264.json"
-    IMAGE_PATH = rf"C:\Users\User\Desktop\ILSData-main\ScenerioExports\weather\{WEATHER_FOLDER}\usable\images\AutoScenario_264.png"
+    RAW_TELEMETRY = rf"C:\Users\User\Desktop\ILSData-main\ScenerioExports\weather\{WEATHER_FOLDER}\usable\telemetry\AutoScenario_405.json"
+    IMAGE_PATH = rf"C:\Users\User\Desktop\ILSData-main\ScenerioExports\weather\{WEATHER_FOLDER}\usable\images\AutoScenario_405.png"
     MODEL_PATH = r"C:\Users\User\Desktop\ILSData-main\models\runway_pose_batch2_best.pt"
 
     os.makedirs("runs/std_telemetry", exist_ok=True)
-    STD_TELEMETRY_JSON = "runs/std_telemetry/AutoScenario_264_telemetry_std.json"
+    STD_TELEMETRY_JSON = "runs/std_telemetry/AutoScenario_405_telemetry_std.json"
 
     # Step A: Standardize telemetry JSON
     std_telemetry_data = parse_msfs_v3_json(RAW_TELEMETRY, WEATHER_FOLDER)
@@ -176,7 +176,7 @@ if __name__ == "__main__":
     print(json.dumps(guidance_output, indent=2))
 
     # Step D: Render Verification Image with Arc terminating at Touchdown Point
-    VIS_OUTPUT_PATH = "runs/inference/AutoScenario_264_glide_path_verified.png"
+    VIS_OUTPUT_PATH = "runs/inference/AutoScenario_405_glide_path_verified.png"
     visualize_glide_path_verification(
         image_path=IMAGE_PATH,
         coords_json_path=coords_json_path,
