@@ -1,0 +1,17 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# Deep Learning & YOLOv8 Pose Detection (GPU-accelerated)
+torch>=2.1.0
+torchvision>=0.16.0
+ultralytics>=8.1.0
+
+# Computer Vision, Screen Capture & Math Core
+opencv-python>=4.8.0
+numpy>=1.24.0,<2.0.0
+mss>=9.0.1
+
+# MATLAB (.mat) Array Bridge
+scipy>=1.11.0
+
+# MSFS 2024 Telemetry Bridge (Optional on FlightGear-only machines)
+SimConnect>=0.4.26

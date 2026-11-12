@@ -22,6 +22,24 @@ class RunwayDetectorCore:
         self.device = device
         self.model = None
 
+    def warmup(self):
+        """
+        Pre-loads the YOLO model and runs a single dummy frame on the GPU
+        so Frame 0 of any video or simulation stream executes in < 15 ms
+        instead of waiting 5-7 seconds for CUDA context initialization.
+        """
+        self._ensure_model_loaded()
+        self.logger.info("Running GPU CUDA warmup pass...")
+        dummy_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.model.predict(
+            source=dummy_frame,
+            imgsz=self.imgsz,
+            conf=self.default_conf,
+            device=self.device,
+            verbose=False
+        )
+        self.logger.info("GPU warmup complete. Ready for real-time frame 0 lock.")
+
     def _ensure_model_loaded(self):
         """Lazy-loads the YOLO model only when first called."""
         if self.model is None:

@@ -11,32 +11,102 @@ from runway_json_exporter import RunwayJsonExporter
 from glide_path_core import GlidePathVectorCore
 
 
-def create_dynamic_frame_telemetry_json(
-    frame_idx, width_px, height_px, coords_dict, out_json_path,
-    v_fov_deg=28.555, rwy_width_m=45.0, rwy_length_m=3345.0, gs_deg=3.0
-):
+class OpticalStateFilter:
     """
-    Creates a standardized telemetry JSON for a video frame so GlidePathVectorCore
-    can be called via its standard two-JSON input logger interface.
+    Extracts and smooths camera Pitch, Roll, and AGL Altitude directly from
+    the 4 detected runway corners. Guarantees valid ground projection even when
+    the camera is pitched nose-down and the runway sits above cy (Y < 540 px).
     """
-    intr = compute_camera_intrinsics(width_px, height_px, v_fov_deg)
-    fx = intr["fx_px"]
+    def __init__(self, alpha_attitude=0.45, alpha_agl=0.30):
+        self.alpha_att = alpha_attitude
+        self.alpha_agl = alpha_agl
+        self.pitch_deg = -3.0
+        self.roll_deg = 0.0
+        self.agl_m = 180.0
+        self.initialized = False
 
-    # Estimate dynamic AGL altitude from optical threshold pixel width during video approach
-    est_agl_m = 180.0
-    wow_flag = False
-    if coords_dict.get("runway_detected") and coords_dict.get("corners_ordered_list"):
-        pts = np.array(coords_dict["corners_ordered_list"], dtype=np.float64)
-        w_near_px = max(float(np.linalg.norm(pts[0] - pts[1])), 8.0)
+    def update_from_corners(self, corners_ordered_list, fx, fy, cx, cy, rwy_width_m=45.0, gs_deg=3.0):
+        pts = np.array(corners_ordered_list, dtype=np.float64)
+        nr, nl, fl, fr = pts[0], pts[1], pts[2], pts[3]
+
+        # 1. Optical Roll from Near Threshold slope (NR -> NL)
+        dx_t = nr[0] - nl[0]
+        dy_t = nr[1] - nl[1]
+        raw_roll = self.roll_deg
+        if abs(dx_t) > 5.0:
+            raw_roll = float(np.clip(-math.degrees(math.atan2(dy_t, dx_t)), -30.0, 30.0))
+
+        # 2. Optical Pitch from Sideline Vanishing Point (Horizon Line)
+        near_mid_y = 0.5 * (nr[1] + nl[1])
+        far_mid_y = 0.5 * (fl[1] + fr[1])
+
+        v_left = fl - nl
+        v_right = fr - nr
+        denom = v_left[0] * v_right[1] - v_left[1] * v_right[0]
+
+        if abs(denom) > 1e-3:
+            t_vp = ((nr[0] - nl[0]) * v_right[1] - (nr[1] - nl[1]) * v_right[0]) / denom
+            vp_y = nl[1] + t_vp * v_left[1]
+            # Horizon must logically sit above the far threshold on screen
+            vp_y = min(vp_y, far_mid_y - 12.0)
+        else:
+            vp_y = far_mid_y - 35.0
+
+        # Camera pitch angle from horizon vertical pixel position:
+        # When vp_y < cy (horizon is in upper half of screen), camera is pitched DOWN (negative pitch)
+        raw_pitch = float(np.clip(math.degrees(math.atan2(vp_y - cy, fy)), -15.0, 15.0))
+
+        # CRITICAL SAFETY CONSTRAINT: Ensure both Near & Far thresholds sit below the optical horizon
+        # in GlidePathVectorCore._project_pixel_to_ground (where down_dir = y_unrolled*cos(theta) - sin(theta))
+        far_ray_angle_deg = math.degrees(math.atan2(far_mid_y - cy, fy))
+        max_valid_pitch_deg = far_ray_angle_deg - 1.8  # Guarantees at least 1.8 deg downward grazing angle
+        if raw_pitch > max_valid_pitch_deg:
+            raw_pitch = max_valid_pitch_deg
+
+        # 3. Dynamic AGL from optical threshold width
+        w_near_px = max(float(np.linalg.norm(nr - nl)), 8.0)
         est_slant_m = (rwy_width_m * fx) / w_near_px
-        est_agl_m = max(est_slant_m * math.tan(math.radians(gs_deg)) - 6.0, 0.5)
-        if est_agl_m <= 1.2:
-            wow_flag = True
+        raw_agl = max(est_slant_m * math.tan(math.radians(gs_deg)), 0.5)
+
+        if not self.initialized:
+            self.pitch_deg = raw_pitch
+            self.roll_deg = raw_roll
+            self.agl_m = raw_agl
+            self.initialized = True
+        else:
+            self.pitch_deg = self.alpha_att * raw_pitch + (1.0 - self.alpha_att) * self.pitch_deg
+            # Keep safety clamp active after smoothing
+            if self.pitch_deg > max_valid_pitch_deg:
+                self.pitch_deg = max_valid_pitch_deg
+            self.roll_deg = self.alpha_att * raw_roll + (1.0 - self.alpha_att) * self.roll_deg
+            self.agl_m = self.alpha_agl * raw_agl + (1.0 - self.alpha_agl) * self.agl_m
+
+        return self.pitch_deg, self.roll_deg, self.agl_m
+
+
+def create_dynamic_frame_telemetry_json(
+    frame_idx, width_px, height_px, coords_dict, state_filter: OpticalStateFilter,
+    out_json_path, v_fov_deg=28.555, rwy_width_m=45.0, rwy_length_m=3345.0, gs_deg=3.0
+):
+    intr = compute_camera_intrinsics(width_px, height_px, v_fov_deg)
+    fx, fy = intr["fx_px"], intr["fy_px"]
+    cx, cy = intr["cx_px"], intr["cy_px"]
+
+    if coords_dict.get("runway_detected") and coords_dict.get("corners_ordered_list"):
+        opt_pitch_deg, opt_roll_deg, est_agl_m = state_filter.update_from_corners(
+            coords_dict["corners_ordered_list"], fx, fy, cx, cy, rwy_width_m, gs_deg
+        )
+    else:
+        opt_pitch_deg = state_filter.pitch_deg
+        opt_roll_deg = state_filter.roll_deg
+        est_agl_m = state_filter.agl_m
+
+    wow_flag = bool(est_agl_m <= 1.2)
 
     telemetry_payload = {
         "schema_version": "canonical-autoland-telemetry/v1.0",
         "meta": {
-            "source_type": "VIDEO_STREAM_30FPS",
+            "source_type": "VIDEO_STREAM_STRIDE_4",
             "scenario_id": f"VideoFrame_{frame_idx:05d}",
             "weather_condition": "Video_Capture"
         },
@@ -46,8 +116,8 @@ def create_dynamic_frame_telemetry_json(
             "altitude_msl_m": round(389.0 + est_agl_m, 3),
             "altitude_agl_m": round(est_agl_m, 3),
             "altitude_agl_ft": round(est_agl_m * 3.28084, 2),
-            "pitch_deg": 0.0,
-            "roll_deg": 0.0,
+            "pitch_deg": round(opt_pitch_deg, 4),
+            "roll_deg": round(opt_roll_deg, 4),
             "heading_true_deg": 252.1,
             "tas_mps": 72.0,
             "ias_mps": 69.5,
@@ -57,9 +127,9 @@ def create_dynamic_frame_telemetry_json(
             "hardware_mls_available": False
         },
         "camera_state": {
-            "pitch_deg": 0.0,
-            "raw_pitch_deg": 0.05,
-            "roll_deg": 0.0,
+            "pitch_deg": round(opt_pitch_deg, 4),
+            "raw_pitch_deg": round(opt_pitch_deg, 4),
+            "roll_deg": round(opt_roll_deg, 4),
             "heading_true_deg": 252.1,
             "intrinsics": intr
         },
@@ -80,7 +150,6 @@ def create_dynamic_frame_telemetry_json(
 
 
 def render_hud_on_frame(frame, coords_data, guidance_output, core_exec_ms, video_fps, frame_idx, stride):
-    """Draws the runway polygon, 2-stage ground capture corridor, and FMA HUD onto the video frame."""
     h, w = frame.shape[:2]
     cam_center = (int(w / 2), int(h / 2))
 
@@ -102,7 +171,7 @@ def render_hud_on_frame(frame, coords_data, guidance_output, core_exec_ms, video
         ext_pt = near_mid + 2.2 * rwy_dir
         cv2.line(frame, (int(far_mid[0]), int(far_mid[1])), (int(ext_pt[0]), int(ext_pt[1])), (0, 140, 0), 1, cv2.LINE_AA)
 
-        # 3. Two-Stage Ground Corridor (APPR Curve + ALIGN/FLARE Straight Centerline)
+        # 3. Two-Stage Ground Corridor
         screen_targets = guidance_output.get("screen_targets_px", {})
         appr_pts = screen_targets.get("appr_capture_corridor_px", [])
         align_pts = screen_targets.get("align_flare_centerline_px", [])
@@ -133,12 +202,12 @@ def render_hud_on_frame(frame, coords_data, guidance_output, core_exec_ms, video
         ils_dev = guidance_output["virtual_ils_deviations"]
 
         overlay = frame.copy()
-        cv2.rectangle(overlay, (20, 20), (780, 290), (15, 15, 15), -1)
+        cv2.rectangle(overlay, (20, 20), (790, 290), (15, 15, 15), -1)
         cv2.addWeighted(overlay, 0.76, frame, 0.24, 0, frame)
 
         active_fma = phase["active_mode"]
         hud_lines = [
-            (f"FMA MODE: [{active_fma}] | Calc Stride: 1/{stride} Frames | Core: {core_exec_ms:.2f} ms | FPS: {video_fps:.1f}", (0, 255, 0)),
+            (f"FMA MODE: [{active_fma}] | Calc Rate: 1/{stride} Frames (7.5 Hz) | Core: {core_exec_ms:.2f} ms | FPS: {video_fps:.1f}", (0, 255, 0)),
             (f"Phase Logic: {phase['phase_description']}", (180, 255, 255)),
             (f"Alt AGL: {vis_est['fused_agl_altitude_ft']:.0f} ft ({vis_est['fused_agl_altitude_m']:.1f} m) | WoW: {phase['wow_active']} (Poll: {phase['wow_polling_rate_ms']:.0f} ms)", (255, 255, 255)),
             (f"Dist to Threshold: {vis_est['distance_to_threshold_m']:.1f} m | Lat Offset: {vis_est['lateral_offset_m']:+.1f} m | Rel Yaw: {vis_est['relative_yaw_to_runway_deg']:+.2f} deg", (255, 255, 255)),
@@ -148,20 +217,24 @@ def render_hud_on_frame(frame, coords_data, guidance_output, core_exec_ms, video
         for i, (text, col) in enumerate(hud_lines):
             cv2.putText(frame, text, (35, 50 + i * 36), cv2.FONT_HERSHEY_SIMPLEX, 0.49, col, 1, cv2.LINE_AA)
     else:
-        cv2.putText(frame, f"SEARCHING FOR RUNWAY... | Frame: {frame_idx} | FPS: {video_fps:.1f}",
+        status_msg = "RUNWAY DETECTED - COMPUTING..." if (coords_data and coords_data.get("runway_detected")) else "SEARCHING FOR RUNWAY..."
+        cv2.putText(frame, f"{status_msg} | Frame: {frame_idx} | FPS: {video_fps:.1f}",
                     (35, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2, cv2.LINE_AA)
 
 
 def run_video_glidepath_evaluation(
     video_path,
     model_path="models/runway_pose_batch2_best.pt",
-    glidepath_stride=10,
-    conf_threshold=0.75,
+    glidepath_stride=4,
+    conf_threshold=0.45,
     show_live=True
 ):
     detector = RunwayDetectorCore(model_path=model_path, default_conf=conf_threshold)
+    detector.warmup()
+
     exporter = RunwayJsonExporter(detector=detector, output_dir="runs/video_eval_jsons/coords")
     glide_solver = GlidePathVectorCore(target_glideslope_deg=3.0, touchdown_offset_m=300.0)
+    state_filter = OpticalStateFilter(alpha_attitude=0.45, alpha_agl=0.30)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -172,7 +245,7 @@ def run_video_glidepath_evaluation(
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
     os.makedirs("runs/inference", exist_ok=True)
-    out_video_path = "runs/inference/landing_video_autoland_verified.mp4"
+    out_video_path = f"runs/inference/landing_video_autoland_stride{glidepath_stride}.mp4"
     writer = cv2.VideoWriter(out_video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps_in, (width, height))
 
     frame_idx = 0
@@ -192,7 +265,6 @@ def run_video_glidepath_evaluation(
         inst_fps = 1.0 / max(now - prev_frame_time, 1e-6)
         prev_frame_time = now
 
-        # Trigger Vision + GlidePathVectorCore on every Nth frame (e.g., 1 in 10 frames)
         if frame_idx % glidepath_stride == 0:
             coords_json_path, last_coords_data = exporter.export_from_sim_frame(
                 frame_bgr=frame,
@@ -207,6 +279,7 @@ def run_video_glidepath_evaluation(
                 width_px=width,
                 height_px=height,
                 coords_dict=last_coords_data,
+                state_filter=state_filter,
                 out_json_path="runs/video_eval_jsons/latest_telemetry_std.json"
             )
 
@@ -217,7 +290,6 @@ def run_video_glidepath_evaluation(
             )
             last_core_exec_ms = (time.perf_counter() - t0) * 1000.0
 
-        # Render latest computed trajectory & HUD onto current frame
         render_hud_on_frame(
             frame=frame,
             coords_data=last_coords_data,
@@ -230,7 +302,7 @@ def run_video_glidepath_evaluation(
 
         writer.write(frame)
         if show_live:
-            cv2.imshow("Autoland 1-in-10 Frame Video Verification", cv2.resize(frame, (1280, 720)))
+            cv2.imshow(f"Autoland 1-in-{glidepath_stride} Frame Video Verification", cv2.resize(frame, (1280, 720)))
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
@@ -248,7 +320,7 @@ if __name__ == "__main__":
     run_video_glidepath_evaluation(
         video_path=VIDEO_PATH,
         model_path=MODEL_PATH,
-        glidepath_stride=10,
-        conf_threshold=0.75,
+        glidepath_stride=4,
+        conf_threshold=0.45,
         show_live=True
     )
